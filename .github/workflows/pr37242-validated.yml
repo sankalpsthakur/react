@@ -1,0 +1,47 @@
+name: PR37242 full correction validation
+on:
+  push:
+    branches: [validation/pr37242-abort-cleanup-20260918]
+    paths: [.github/workflows/pr37242-validated.yml]
+permissions:
+  contents: read
+jobs:
+  validate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: 5757a3242e32773283aedfeaec69d80adc103139
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: '22'
+      - run: yarn install --frozen-lockfile
+      - name: Execute test corrections and mutation checks
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p evidence
+          python3 - <<'PY'
+          from pathlib import Path
+          from urllib.request import urlopen
+          import textwrap
+          url='https://raw.githubusercontent.com/sankalpsthakur/react/eb8eee550b4f350bbcc03967da9d4a7033cdaaf0/.github/workflows/pr37242-correction-validation.yml'
+          workflow=urlopen(url,timeout=30).read().decode()
+          script=textwrap.dedent(workflow.split("          python3 - <<'PY'\n",1)[1].split('\n          PY',1)[0])
+          old="['yarn','exec','prettier','--write',str(browser),str(node)]"
+          assert script.count(old)==1
+          script=script.replace(old,"['node','node_modules/prettier/bin/prettier.cjs','--write',str(browser),str(node)]")
+          old="['yarn','exec','eslint',str(browser),str(node),'--max-warnings','0']"
+          assert script.count(old)==1
+          script=script.replace(old,"['node','node_modules/eslint/bin/eslint.js',str(browser),str(node),'--max-warnings','0']")
+          Path('evidence/validation.py').write_text(script)
+          exec(compile(script,'<validation>','exec'))
+          PY
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: react-37242-correction
+          path: evidence/
+          retention-days: 14
