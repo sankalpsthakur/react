@@ -1,0 +1,67 @@
+name: Stage reviewed PR37242 correction
+on:
+  push:
+    branches: [validation/pr37242-abort-cleanup-20260918]
+    paths: [.github/workflows/pr37242-stage-reviewed.yml]
+permissions: {}
+jobs:
+  stage:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: write
+      actions: read
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: react-37242-correction
+          run-id: 35314750804
+          github-token: ${{ github.token }}
+          path: evidence
+      - name: Verify reviewed bytes and create Git objects only
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import hashlib,json,os
+          from pathlib import Path
+          from urllib.request import Request,urlopen
+          repo='sankalpsthakur/react'
+          base='5757a3242e32773283aedfeaec69d80adc103139'
+          prefix='https://api.github.com/repos/'+repo+'/'
+          def api(path,data=None):
+              req=Request(prefix+path, data=None if data is None else json.dumps(data).encode(), headers={'Authorization':'Bearer '+os.environ['GH_TOKEN'],'Accept':'application/vnd.github+json','Content-Type':'application/json','X-GitHub-Api-Version':'2022-11-28'})
+              with urlopen(req,timeout=30) as response:return json.load(response)
+          run=api('actions/runs/35314750804')
+          assert run['head_sha']=='6b3fc5b0bc9a5431c9d2169e8af1b49667326cb8' and run['conclusion']=='success'
+          report=json.loads(Path('evidence/results.json').read_text())
+          assert report['base']==base
+          for key in ['focused_after','old_node_misses_cleanup','development_suites','production_suites','lint_changed','whitespace']:
+              assert report[key]['exit']==0,(key,report[key])
+          for key in ['cleanup_mutation','instrumentation_mutation']:assert report[key]['exit']!=0
+          expected={
+              'packages/react-dom/src/__tests__/ReactDOMFizzServerBrowser-test.js':('ReactDOMFizzServerBrowser-test.js','595bc6d66ab37912febeab991cfd9f837fc66c0e21bbe5b95414ecd4cffb1b44'),
+              'packages/react-dom/src/__tests__/ReactDOMFizzServerNode-test.js':('ReactDOMFizzServerNode-test.js','6939bdf07ffb5e4373e70034306a77997b032f3474cebbc284023967e6b2b2be'),
+          }
+          assert sorted(report['changed_paths'])==sorted(expected)
+          assert api('git/ref/heads/fix/36763-fizz-abortsignal-leak')['object']['sha']==base,'Feature branch moved; no ref changed'
+          elements=[]
+          for path,(name,digest) in expected.items():
+              content=Path('evidence',name).read_bytes()
+              assert hashlib.sha256(content).hexdigest()==digest,path
+              blob=api('git/blobs',{'content':content.decode(),'encoding':'utf-8'})
+              assert blob['sha']==hashlib.sha1(('blob '+str(len(content))+'\0').encode()+content).hexdigest()
+              elements.append({'path':path,'mode':'100644','type':'blob','sha':blob['sha']})
+          tree=api('git/trees',{'base_tree':api('git/commits/'+base)['tree']['sha'],'tree':elements})
+          commit=api('git/commits',{'message':'Verify AbortSignal cleanup with native Node controllers\n\nFail explicitly when browser instrumentation is missing and probe listener additions/removals. Use native controllers for the Node caller and render lifetime, restoring the test global afterward.\n\nValidation run 35314750804: both Fizz suites pass in development and production (40 tests, 14 snapshots each). Disabling cleanup fails both new tests while the old Node test passes. No production source changes.\n\nAI-assisted implementation and validation.','tree':tree['sha'],'parents':[base],'author':{'name':'Sankalp Thakur','email':'31366524+sankalpsthakur@users.noreply.github.com'}})
+          receipt={'repository':repo,'parent':base,'commit_sha':commit['sha'],'tree_sha':tree['sha'],'files':elements,'validation_run':35314750804,'branch_updated':False}
+          Path('evidence/staged-commit.json').write_text(json.dumps(receipt,indent=2)+'\n')
+          print(json.dumps(receipt,indent=2))
+          PY
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: react-reviewed-correction-commit
+          path: evidence/
+          retention-days: 14
