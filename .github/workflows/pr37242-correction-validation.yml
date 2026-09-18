@@ -1,0 +1,177 @@
+name: PR37242 cleanup correction validation
+on:
+  push:
+    branches: [validation/pr37242-abort-cleanup-20260918]
+    paths: [.github/workflows/pr37242-correction-validation.yml]
+permissions:
+  contents: read
+jobs:
+  validate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: 5757a3242e32773283aedfeaec69d80adc103139
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: '22'
+      - name: Install locked test dependencies
+        run: yarn install --frozen-lockfile
+      - name: Harden tests and prove they catch broken cleanup
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p evidence
+          python3 - <<'PY'
+          from pathlib import Path
+          import json, subprocess
+          root=Path.cwd()
+          evidence=root/'evidence'
+          report={'base': subprocess.check_output(['git','rev-parse','HEAD'],text=True).strip(), 'node':subprocess.check_output(['node','--version'],text=True).strip(), 'published':False}
+          assert report['base']=='5757a3242e32773283aedfeaec69d80adc103139'
+          folder=Path('packages/react-dom/src/__tests__')
+          browser=folder/'ReactDOMFizzServerBrowser-test.js'
+          node=folder/'ReactDOMFizzServerNode-test.js'
+          production=Path('packages/react-server/src/ReactFizzServer.js')
+          originals={f:f.read_text() for f in [browser,node,production]}
+          marker="  it('removes AbortSignal listeners when renderToReadableStream completes', async () => {"
+          def replace_test(file,replacement,next_test):
+              text=originals[file]
+              assert text.count(marker)==1
+              start=text.index(marker)
+              end=text.index(next_test,start)
+              file.write_text(text[:start]+replacement+'\n\n'+text[end:])
+          browser_test='''  it('removes AbortSignal listeners when renderToReadableStream completes', async () => {
+              // jsdom removes signal-bound listeners internally, not through a
+              // removeEventListener call that a spy could observe.
+              const controller = new AbortController();
+              const signal = controller.signal;
+              const implSymbol = Object.getOwnPropertySymbols(signal).find(
+                s => s.toString() === 'Symbol(impl)',
+              );
+
+              function activeAbortListenerCount() {
+                expect(implSymbol).toBeDefined();
+                const impl = signal[implSymbol];
+                expect(impl).toBeDefined();
+                expect(impl._eventListeners).toBeDefined();
+                const listeners = impl._eventListeners.abort;
+                if (listeners === undefined) {
+                  return 0;
+                }
+                expect(Array.isArray(listeners)).toBe(true);
+                return listeners.length;
+              }
+
+              // Prove the counter observes additions and removals before relying on it.
+              const probe = () => {};
+              expect(activeAbortListenerCount()).toBe(0);
+              signal.addEventListener('abort', probe);
+              expect(activeAbortListenerCount()).toBe(1);
+              signal.removeEventListener('abort', probe);
+              expect(activeAbortListenerCount()).toBe(0);
+
+              for (let i = 0; i < 3; i++) {
+                const stream = await serverAct(() =>
+                  ReactDOMFizzServer.renderToReadableStream(<div>hello {i}</div>, {
+                    signal,
+                  }),
+                );
+                await readResult(stream);
+                await stream.allReady;
+                expect(activeAbortListenerCount()).toBe(0);
+              }
+            });'''
+          node_test='''  it('removes AbortSignal listeners when renderToReadableStream completes', async () => {
+              const {getEventListeners} = require('node:events');
+              const {transferableAbortController} = require('node:util');
+              const previousAbortController = global.AbortController;
+              // This environment's polyfill ignores the signal listener option.
+              // Use native controllers for both the caller and the render lifetime.
+              global.AbortController = transferableAbortController().constructor;
+              try {
+                const controller = new AbortController();
+                const signal = controller.signal;
+                const activeAbortListenerCount = () =>
+                  getEventListeners(signal, 'abort').length;
+                const probe = () => {};
+                expect(activeAbortListenerCount()).toBe(0);
+                signal.addEventListener('abort', probe);
+                expect(activeAbortListenerCount()).toBe(1);
+                signal.removeEventListener('abort', probe);
+                expect(activeAbortListenerCount()).toBe(0);
+
+                for (let i = 0; i < 3; i++) {
+                  const stream = await act(() =>
+                    ReactDOMFizzServer.renderToReadableStream(<div>hello {i}</div>, {
+                      signal,
+                    }),
+                  );
+                  await readContentWeb(stream);
+                  await stream.allReady;
+                  expect(activeAbortListenerCount()).toBe(0);
+                }
+              } finally {
+                global.AbortController = previousAbortController;
+              }
+            });'''
+          # Normalize the indentation of the compact embedded replacements.
+          def normalize(s):
+              lines=s.splitlines()
+              return '\n'.join([lines[0]]+[line[10:] if line.startswith('          ') else line for line in lines[1:]])
+          replace_test(browser,normalize(browser_test),"  it('should reject if aborting before the shell is complete'")
+          replace_test(node,normalize(node_test),"  it('flush fully if piping in on onShellReady'")
+          def run(name,args,timeout=600):
+              p=subprocess.run(args,text=True,stdout=subprocess.PIPE,stderr=subprocess.STDOUT,timeout=timeout)
+              (evidence/(name+'.log')).write_text(p.stdout)
+              report[name]={'command':args,'exit':p.returncode}
+              (evidence/'results.json').write_text(json.dumps(report,indent=2)+'\n')
+              print(name,p.returncode,p.stdout[-2200:],flush=True)
+              return p
+          base=['yarn','test','ReactDOMFizzServerBrowser','ReactDOMFizzServerNode','--runInBand','--ci']
+          focus=['-t','removes AbortSignal listeners when renderToReadableStream completes']
+          needle='    {signal: request.renderLifetimeController.signal},\n'
+          try:
+              assert run('format',['yarn','exec','prettier','--write',str(browser),str(node)]).returncode==0
+              corrected={f:f.read_text() for f in [browser,node]}
+              assert run('focused_after',base+focus).returncode==0
+              # A deliberate validation-only mutation removes real lifetime cleanup.
+              assert originals[production].count(needle)==1
+              production.write_text(originals[production].replace(needle,''))
+              mutant=run('cleanup_mutation',base+focus)
+              assert mutant.returncode!=0 and 'Expected: 0' in mutant.stdout, 'Mutant did not exercise listener assertions'
+              assert 'ReactDOMFizzServerNode-test.js' in mutant.stdout and 'ReactDOMFizzServerBrowser-test.js' in mutant.stdout
+              # Demonstrate that the previous Node test missed this exact defect.
+              node.write_text(originals[node])
+              old=run('old_node_misses_cleanup',['yarn','test','ReactDOMFizzServerNode','--runInBand','--ci']+focus)
+              assert old.returncode==0, 'Old test did not reproduce the blind spot'
+              node.write_text(corrected[node])
+              production.write_text(originals[production])
+              # Missing instrumentation must now fail rather than return zero.
+              browser.write_text(corrected[browser].replace("s => s.toString() === 'Symbol(impl)'","s => s.toString() === 'Symbol(missing)'"))
+              instrument=run('instrumentation_mutation',['yarn','test','ReactDOMFizzServerBrowser','--runInBand','--ci']+focus)
+              assert instrument.returncode!=0 and 'toBeDefined' in instrument.stdout
+              browser.write_text(corrected[browser])
+              assert run('development_suites',base,900).returncode==0
+              assert run('production_suites',base+['--prod'],900).returncode==0
+              assert run('lint_changed',['yarn','exec','eslint',str(browser),str(node),'--max-warnings','0']).returncode==0
+              assert run('whitespace',['git','diff','--check']).returncode==0
+              report['changed_paths']=subprocess.check_output(['git','diff','--name-only'],text=True).splitlines()
+              assert report['changed_paths']==[str(browser),str(node)]
+              report['status']='tested; not pushed to feature branch'
+          finally:
+              production.write_text(originals[production])
+              if 'corrected' in locals():
+                  for f,text in corrected.items():f.write_text(text)
+              (evidence/'correction.patch').write_bytes(subprocess.check_output(['git','diff','--binary','--',str(browser),str(node)]))
+              for f in [browser,node]:(evidence/f.name).write_text(f.read_text())
+              (evidence/'results.json').write_text(json.dumps(report,indent=2)+'\n')
+          PY
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: react-37242-correction
+          path: evidence/
+          retention-days: 14
